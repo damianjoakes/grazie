@@ -1,4 +1,5 @@
-use crate::http::{HttpRequest, StatusCode};
+use std::any::Any;
+use crate::http::{HttpRequest, HttpResponse, StatusCode};
 use std::sync::Arc;
 
 #[cfg(feature = "serde")]
@@ -7,10 +8,6 @@ use serde::de::DeserializeOwned;
 #[cfg(feature = "serde")]
 use serde::Serialize;
 
-/// Used to understand conceptually the flow that grazie uses to manage web requests.
-/// Requests to an `HttpServer` are handled like so:
-/// `<from client> -> dyn Unpacker -> dyn Seeder[0..n] -> <to dyn Router>`
-///
 /// An `Unpacker` is an object which reads a byte stream from a TCP socket and transforms it into
 /// an HttpRequest object. The body of an `Unpacker` is only passed along as a series of
 /// heap-allocated bytes, the `Unpacker` does not parse the request body, it only packages it into a
@@ -24,6 +21,9 @@ use serde::Serialize;
 /// Management of all transformed data is handled within the `<dyn Router>` handler. The `Router`
 /// is responsible for matching the HttpRequest against a series of internal routes, and providing
 /// the HttpRequest to the correct route.
+///
+/// The `HttpServer` object comes with a default HTTP 1.1 `Unpacker`. In future releases, more
+/// `Unpacker`s will be packaged with `grazie`.
 pub trait Unpacker {
     /// Unpacks a TCP stream and opens up a request object, parsing the contents of the body into
     /// the request.
@@ -50,9 +50,56 @@ pub enum Guard<'a, T> {
     /// `Seeder`s which accept inaccessible guards.
     Inaccessible {
         request: &'a T,
+        respondent: Respondent,
         reason: Option<&'static str>,
         status_code: StatusCode,
     },
+}
+
+impl<'a, T> Guard<'a, T> {
+    /// Checks whether this guard is accessible or not.
+    pub const fn accessible(&self) -> bool {
+        match &self {
+            Guard::Accessible(_) => { true }
+            Guard::Inaccessible { .. } => { false }
+        }
+    }
+
+    /// Checks whether this guard is inaccessible or not.
+    pub const fn inaccessible(&self) -> bool {
+        match &self {
+            Guard::Accessible(_) => { false }
+            Guard::Inaccessible { .. } => { true }
+        }
+    }
+
+    /// Unwraps this `Guard`, exposing an `Accessible` `Guard` value.
+    pub const fn unwrap(self) -> &'a T {
+        match self {
+            Guard::Accessible(value) => { value }
+            Guard::Inaccessible { .. } => { panic!("Called unwrap on an inaccessible guard!"); }
+        }
+    }
+}
+
+/// Contains a `Respondent` for a `Guard::Inaccessible` result from a `Seeder` object.
+///
+/// This enum holds the required action for the next `Seeder` which is handling the result from the
+/// `Seeder` which returned the `Guard::Inaccessible` result.
+pub enum Respondent {
+    /// Create a response directly back to the client.
+    Respond(HttpResponse<BoxBody>),
+
+    /// Pass the current guard to a different seeder.
+    Reseed(Box<dyn SeederFactory>),
+
+    /// Specifies some other option for handling this `Guard` result.
+    Other(Box<dyn Any + Send>),
+
+    /// Ignore the inaccessible state of this Guard, instead, continue as if the `Guard`'s state is
+    /// `Accessible`. This can be useful in creating middleware whose sole purpose is to log
+    /// erroneous requests, while still continuing on with the request chain.
+    Ignore,
 }
 
 /// An object representing some heap-allocated HTTP request's body.
@@ -84,25 +131,11 @@ impl BoxBody {
     ///
     /// This returns `Some(())` if the open is successful, otherwise, this returns
     /// `None.
-    pub fn try_open<B>(&self) -> Box<Option<B>>
+    pub fn open<B>(&self) -> Box<Option<B>>
     where
         B: for<'a> TryFrom<&'a [u8]>,
     {
         Box::new(B::try_from(&self.inner).ok())
-    }
-
-    /// Directly opens the box body as the desired type.
-    ///
-    /// # Panics
-    /// Since this does a direct conversion without checking for an error, it's possible that the
-    /// `BoxBody` data can be corrupted or undefined. `try_open` should be preferred over this
-    /// function. Only use this when confident that this `BoxBody` contains a valid set of data,
-    /// and it's crucial that an extra heap allocation for `Option` in `try_open` cannot be spared.
-    pub fn open<B>(&self) -> Box<B>
-    where
-        B: for<'a> From<&'a [u8]>,
-    {
-        Box::new(B::from(&self.inner))
     }
 
     /// Attempts to convert a provided object back into a byte stream to pass along across the
@@ -119,7 +152,7 @@ impl BoxBody {
         Some(())
     }
 
-    /// Gets an immutable pointer to the raw bytes of this `BoxBody`.
+    /// Gets an immutable reference to the raw bytes of this `BoxBody`.
     pub fn raw_bytes(&self) -> &[u8] {
         &self.inner
     }
@@ -131,7 +164,7 @@ impl BoxBody {
     /// Part of the `serde_json` feature, this can only be done for types which implement
     /// the `DeserializeOwned` trait.
     #[cfg(feature = "serde_json")]
-    pub fn open_json<D>(&self) -> Option<D>
+    pub fn open_json<D>(&self) -> impl Future<Output = Option<D>> + Send
     where
         D: DeserializeOwned,
     {
@@ -145,7 +178,7 @@ impl BoxBody {
     /// Part of the `serde_json` feature, this can only be done for types which implement
     /// the `Serialize` trait.
     #[cfg(feature = "serde_json")]
-    pub fn close_json<S>(&mut self, json: S) -> Option<()>
+    pub fn close_json<S>(&mut self, json: S) -> impl Future<Output = Option<()>> + Send
     where
         S: Serialize,
     {
@@ -167,7 +200,7 @@ impl BoxBody {
     /// Part of the `serde_xml` feature, this can only be done for types which implement
     /// the `Serialize` trait.
     #[cfg(feature = "serde_xml")]
-    pub fn open_xml<D>(&self) -> Option<D>
+    pub fn open_xml<D>(&self) -> impl Future<Output = Option<D>> + Send
     where
         D: DeserializeOwned,
     {
@@ -181,13 +214,13 @@ impl BoxBody {
     /// Part of the `serde_xml` feature, this can only be done for types which implement
     /// the `Serialize` trait.
     #[cfg(feature = "serde_xml")]
-    pub fn close_xml<S>(&mut self, xml: S) -> Option<()>
+    pub fn close_xml<S>(&mut self, xml: S) -> impl Future<Output = Option<()>> + Send
     where
         S: Serialize,
     {
         match serde_xml_rs::to_string(&xml).ok() {
             Some(b) => {
-                let bx = Box::new(*b.as_bytes());
+                let bx = b.into_bytes().into_boxed_slice();
                 self.inner = Arc::from(bx);
 
                 Some(())
@@ -197,10 +230,33 @@ impl BoxBody {
     }
 }
 
-/// A middleware implementor.
+/// Trait implemented on an object which may create any `Seeder` object.
+///
+/// `SeederFactory` objects generally don't maintain instances of themselves, they should be a
+/// static, sized struct whose sole purpose is instantiating `Seeder` objects.
+///
+/// The purposed of the `SeederFactory` is to allow for a `Seeder` to be re-instantiated by other
+/// `Seeder`s during the request chain, during operations which may require reprocessing of an
+/// `HttpRequest`.
+pub trait SeederFactory: 'static  {
+    /// Creates a new `Seeder`.
+    fn create<T: Seeder>() -> T
+    where
+        Self: Sized;
+}
+
+/// Trait implemented on an object which implements some middleware functionality.
+///
+/// Structs which implement `Seeder` can be constructed and passed to the HTTP server to check
+/// or update the parameters of an HTTP request.
 pub trait Seeder {
+    /// When an HttpRequest is passed through the server into this `Seeder`, the `seed` method is
+    /// invoked. The `seed` method accepts a guarded `HttpRequest` object, and, depending on this
+    /// seeder's implementation, must reject or accept the `HttpRequest`. If the `HttpRequest` is
+    /// accepted, then this must return `Guard::Accessible(&HttpRequest)`.
     fn seed(
         &self,
         input: Guard<&HttpRequest<BoxBody>>,
     ) -> impl Future<Output = Guard<&HttpRequest<BoxBody>>> + Send;
 }
+
